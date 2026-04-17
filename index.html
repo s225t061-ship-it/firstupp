@@ -1,1 +1,487 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
+// --- 定数 ---
+const BOARD_WIDTH = 10;
+const BOARD_HEIGHT = 20;
+const INITIAL_TICK_RATE = 800;
+const MIN_TICK_RATE = 100;
+const GARBAGE_RATE_MS = 15000; // 15秒ごとにおじゃまブロックが上がる
+
+// ブロックの形状と色（ネオンカラー＆発光エフェクトを追加）
+const TETROMINOES = {
+  I: { shape: [[1, 1, 1, 1]], color: 'bg-cyan-400', border: 'border-cyan-200', glow: 'shadow-[0_0_12px_rgba(34,211,238,0.9)]' },
+  J: { shape: [[1, 0, 0], [1, 1, 1]], color: 'bg-blue-500', border: 'border-blue-200', glow: 'shadow-[0_0_12px_rgba(59,130,246,0.9)]' },
+  L: { shape: [[0, 0, 1], [1, 1, 1]], color: 'bg-orange-400', border: 'border-orange-200', glow: 'shadow-[0_0_12px_rgba(251,146,60,0.9)]' },
+  O: { shape: [[1, 1], [1, 1]], color: 'bg-yellow-400', border: 'border-yellow-200', glow: 'shadow-[0_0_12px_rgba(250,204,21,0.9)]' },
+  S: { shape: [[0, 1, 1], [1, 1, 0]], color: 'bg-lime-400', border: 'border-lime-200', glow: 'shadow-[0_0_12px_rgba(163,230,53,0.9)]' },
+  T: { shape: [[0, 1, 0], [1, 1, 1]], color: 'bg-purple-500', border: 'border-purple-200', glow: 'shadow-[0_0_12px_rgba(168,85,247,0.9)]' },
+  Z: { shape: [[1, 1, 0], [0, 1, 1]], color: 'bg-pink-500', border: 'border-pink-200', glow: 'shadow-[0_0_12px_rgba(236,72,153,0.9)]' },
+};
+
+const TETROMINO_KEYS = Object.keys(TETROMINOES);
+
+// おじゃまブロックの定義（ネオン風）
+const GARBAGE_BLOCK = { color: 'bg-slate-700', border: 'border-slate-400', glow: 'shadow-[0_0_8px_rgba(148,163,184,0.6)]', isGarbage: true };
+
+// 空のボードを生成
+const createEmptyGrid = () => Array.from({ length: BOARD_HEIGHT }, () => Array(BOARD_WIDTH).fill(null));
+
+// 配列をシャッフルする関数（フィッシャー–イェーツのシャッフル）
+const shuffleArray = (array) => {
+  const newArray = [...array];
+  for (let i = newArray.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
+  }
+  return newArray;
+};
+
+// カスタムフック：正確なインターバルタイマー
+function useInterval(callback, delay) {
+  const savedCallback = useRef();
+
+  useEffect(() => {
+    savedCallback.current = callback;
+  }, [callback]);
+
+  useEffect(() => {
+    function tick() {
+      savedCallback.current();
+    }
+    if (delay !== null) {
+      let id = setInterval(tick, delay);
+      return () => clearInterval(id);
+    }
+  }, [delay]);
+}
+
+export default function App() {
+  const [grid, setGrid] = useState(createEmptyGrid());
+  const [currentPiece, setCurrentPiece] = useState(null);
+  const [nextPiece, setNextPiece] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isGameOver, setIsGameOver] = useState(false);
+  const [score, setScore] = useState(0);
+  const [level, setLevel] = useState(1);
+  const [dropSpeed, setDropSpeed] = useState(null);
+  const [garbageTimer, setGarbageTimer] = useState(null);
+  
+  // 7種1セットのバッグを管理するステート
+  const [pieceBag, setPieceBag] = useState([]);
+
+  // バッグから次のブロックを取り出す（足りなければ補充する）
+  const getNextPieceFromBag = useCallback((currentBag) => {
+    let newBag = [...currentBag];
+    if (newBag.length === 0) {
+      // バッグが空なら、7種類のキーをシャッフルして補充
+      newBag = shuffleArray(TETROMINO_KEYS);
+    }
+    const nextKey = newBag.pop(); // バッグの最後から取り出す
+    const piece = { ...TETROMINOES[nextKey], id: Math.random().toString(36).substr(2, 9) };
+    return { piece, newBag };
+  }, []);
+
+  // ゲームスタート
+  const startGame = () => {
+    setGrid(createEmptyGrid());
+    setScore(0);
+    setLevel(1);
+    setIsGameOver(false);
+    setIsPlaying(true);
+    
+    // 初期バッグの生成と最初のブロックの設定
+    const initialBag = shuffleArray(TETROMINO_KEYS);
+    const { piece: firstPiece, newBag: bagAfterFirst } = getNextPieceFromBag(initialBag);
+    const { piece: secondPiece, newBag: bagAfterSecond } = getNextPieceFromBag(bagAfterFirst);
+    
+    setPieceBag(bagAfterSecond);
+    setNextPiece(secondPiece);
+    
+    // spawnPieceはここでは使わず直接セットする（タイミングの問題を避けるため）
+    const spawnX = Math.floor(BOARD_WIDTH / 2) - Math.floor(firstPiece.shape[0].length / 2);
+    setCurrentPiece({ ...firstPiece, x: spawnX, y: 0 });
+
+    setDropSpeed(INITIAL_TICK_RATE);
+    setGarbageTimer(GARBAGE_RATE_MS);
+  };
+
+  // ゲームオーバー処理
+  const gameOver = useCallback(() => {
+    setIsGameOver(true);
+    setIsPlaying(false);
+    setDropSpeed(null);
+    setGarbageTimer(null);
+  }, []);
+
+  // 衝突判定
+  const checkCollision = (shape, x, y, boardGrid) => {
+    for (let row = 0; row < shape.length; row++) {
+      for (let col = 0; col < shape[row].length; col++) {
+        if (shape[row][col] !== 0) {
+          const newY = y + row;
+          const newX = x + col;
+          if (
+            newX < 0 || 
+            newX >= BOARD_WIDTH || 
+            newY >= BOARD_HEIGHT ||
+            (newY >= 0 && boardGrid[newY][newX] !== null)
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  // 次のブロックを出現させる
+  const spawnPiece = useCallback(() => {
+    // 現在のnextPieceを画面上部に出現させる
+    const pieceToSpawn = {
+      ...nextPiece,
+      x: Math.floor(BOARD_WIDTH / 2) - Math.floor(nextPiece.shape[0].length / 2),
+      y: 0,
+    };
+
+    if (checkCollision(pieceToSpawn.shape, pieceToSpawn.x, pieceToSpawn.y, grid)) {
+      gameOver();
+      return;
+    }
+
+    setCurrentPiece(pieceToSpawn);
+
+    // バッグから新しいnextPieceを引く
+    const { piece: newNextPiece, newBag } = getNextPieceFromBag(pieceBag);
+    setNextPiece(newNextPiece);
+    setPieceBag(newBag);
+
+  }, [grid, nextPiece, pieceBag, gameOver, getNextPieceFromBag]);
+
+  // 回転処理（壁蹴り簡易実装付き）
+  const rotateShape = (shape) => shape[0].map((_, index) => shape.map(row => row[index]).reverse());
+
+  const rotate = useCallback(() => {
+    if (!currentPiece || !isPlaying || isGameOver) return;
+    const newShape = rotateShape(currentPiece.shape);
+    
+    if (!checkCollision(newShape, currentPiece.x, currentPiece.y, grid)) {
+      setCurrentPiece({ ...currentPiece, shape: newShape });
+    } else if (!checkCollision(newShape, currentPiece.x - 1, currentPiece.y, grid)) {
+      setCurrentPiece({ ...currentPiece, shape: newShape, x: currentPiece.x - 1 });
+    } else if (!checkCollision(newShape, currentPiece.x + 1, currentPiece.y, grid)) {
+      setCurrentPiece({ ...currentPiece, shape: newShape, x: currentPiece.x + 1 });
+    }
+  }, [currentPiece, isPlaying, isGameOver, grid]);
+
+  // 移動処理
+  const move = useCallback((dirX, dirY) => {
+    if (!currentPiece || !isPlaying || isGameOver) return;
+    const newX = currentPiece.x + dirX;
+    const newY = currentPiece.y + dirY;
+
+    if (!checkCollision(currentPiece.shape, newX, newY, grid)) {
+      setCurrentPiece({ ...currentPiece, x: newX, y: newY });
+    } else if (dirY === 1) {
+      mergePiece();
+    }
+  }, [currentPiece, isPlaying, isGameOver, grid]);
+
+  const drop = useCallback(() => move(0, 1), [move]);
+
+  const hardDrop = useCallback(() => {
+    if (!currentPiece || !isPlaying || isGameOver) return;
+    let newY = currentPiece.y;
+    while (!checkCollision(currentPiece.shape, currentPiece.x, newY + 1, grid)) {
+      newY++;
+    }
+    setCurrentPiece({ ...currentPiece, y: newY });
+    setTimeout(() => move(0, 1), 0); 
+  }, [currentPiece, isPlaying, isGameOver, grid, move]);
+
+  // 盤面への固定
+  const mergePiece = useCallback(() => {
+    const newGrid = grid.map(row => [...row]);
+    let gameIsOver = false;
+
+    currentPiece.shape.forEach((row, y) => {
+      row.forEach((val, x) => {
+        if (val !== 0) {
+          const boardY = currentPiece.y + y;
+          const boardX = currentPiece.x + x;
+          if (boardY < 0) {
+            gameIsOver = true;
+          } else if (boardY < BOARD_HEIGHT) {
+            // 固定時にglow情報も一緒に保存する
+            newGrid[boardY][boardX] = { color: currentPiece.color, border: currentPiece.border, glow: currentPiece.glow };
+          }
+        }
+      });
+    });
+
+    if (gameIsOver) {
+      gameOver();
+      return;
+    }
+
+    setGrid(newGrid);
+    clearLines(newGrid);
+  }, [currentPiece, grid, gameOver]);
+
+  // ライン消去とレベルアップ
+  const clearLines = useCallback((newGrid) => {
+    let linesCleared = 0;
+    const filteredGrid = newGrid.filter(row => {
+      const isLineFull = row.every(cell => cell !== null);
+      if (isLineFull) linesCleared++;
+      return !isLineFull;
+    });
+
+    if (linesCleared > 0) {
+      const emptyLines = Array.from({ length: linesCleared }, () => Array(BOARD_WIDTH).fill(null));
+      const finalGrid = [...emptyLines, ...filteredGrid];
+      setGrid(finalGrid);
+      
+      const scoreMultiplier = [0, 100, 300, 500, 1000];
+      const earnedScore = scoreMultiplier[linesCleared] * level;
+      const newScore = score + earnedScore;
+      setScore(newScore);
+      
+      const newLevel = Math.floor(newScore / 1500) + 1;
+      if (newLevel > level) {
+        setLevel(newLevel);
+        setDropSpeed(prev => Math.max(MIN_TICK_RATE, prev * 0.85));
+      }
+    }
+    
+    // ライン処理が終わったら（または消えなくても）次のブロックを出す
+    spawnPiece();
+    
+  }, [score, level, spawnPiece]);
+
+  // おじゃまブロックのせり上がり処理
+  const addGarbageLines = useCallback(() => {
+    if (!isPlaying || isGameOver) return;
+    
+    if (grid[0].some(cell => cell !== null)) {
+        gameOver();
+        return;
+    }
+
+    setGrid(prevGrid => {
+      const newGrid = [...prevGrid];
+      newGrid.shift();
+      
+      const emptyCol = Math.floor(Math.random() * BOARD_WIDTH);
+      const garbageRow = Array(BOARD_WIDTH).fill(GARBAGE_BLOCK);
+      garbageRow[emptyCol] = null;
+      
+      newGrid.push(garbageRow);
+      return newGrid;
+    });
+
+    if (currentPiece) {
+        const newPieceY = currentPiece.y - 1;
+        if(checkCollision(currentPiece.shape, currentPiece.x, newPieceY, grid)) {
+             setTimeout(() => move(0,1), 0);
+        } else {
+            setCurrentPiece(prev => ({...prev, y: newPieceY}));
+        }
+    }
+  }, [isPlaying, isGameOver, grid, currentPiece, move, gameOver]);
+
+  // キーボードイベント
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (isGameOver) return;
+      if(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+          e.preventDefault();
+      }
+      
+      switch (e.key) {
+        case 'ArrowLeft': move(-1, 0); break;
+        case 'ArrowRight': move(1, 0); break;
+        case 'ArrowDown': move(0, 1); break;
+        case 'ArrowUp': rotate(); break;
+        case ' ': hardDrop(); break;
+        default: break;
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, { passive: false });
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [move, rotate, hardDrop, isGameOver]);
+
+  // 通常落下タイマー
+  useInterval(() => drop(), dropSpeed);
+
+  // おじゃまブロックタイマー
+  useInterval(() => {
+      if(isPlaying) {
+          addGarbageLines();
+          setGarbageTimer(Math.max(5000, GARBAGE_RATE_MS - (level * 500)));
+      }
+  }, garbageTimer);
+
+  // 描画グリッドの合成
+  const displayGrid = grid.map(row => [...row]);
+  if (currentPiece && isPlaying) {
+    currentPiece.shape.forEach((row, y) => {
+      row.forEach((val, x) => {
+        if (val !== 0) {
+          const boardY = currentPiece.y + y;
+          const boardX = currentPiece.x + x;
+          if (boardY >= 0 && boardY < BOARD_HEIGHT && boardX >= 0 && boardX < BOARD_WIDTH) {
+            displayGrid[boardY][boardX] = currentPiece;
+          }
+        }
+      });
+    });
+  }
+
+  const isDarkMode = level >= 5;
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-4 font-sans select-none overflow-hidden"
+         style={{ backgroundImage: 'radial-gradient(circle at center, #1e1b4b 0%, #020617 100%)' }}>
+      <div className="max-w-md w-full relative z-10">
+        
+        {isPlaying && isDarkMode && (
+          <div className="absolute -top-12 left-0 w-full text-center text-pink-500 font-bold animate-pulse drop-shadow-[0_0_8px_rgba(236,72,153,0.8)]">
+            ⚠️ 視界不良モード発動中 ⚠️
+          </div>
+        )}
+
+        <div className="flex justify-between items-end mb-4">
+          <div>
+            <h1 className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-purple-500 to-pink-500 tracking-tighter drop-shadow-[0_0_8px_rgba(168,85,247,0.8)]">
+              NEON DROP
+            </h1>
+            <p className="text-cyan-400 text-sm mt-1 font-mono drop-shadow-[0_0_5px_rgba(34,211,238,0.8)]">LEVEL : {level}</p>
+          </div>
+          <div className="text-right">
+            <p className="text-pink-500 text-xs font-bold tracking-widest drop-shadow-[0_0_5px_rgba(236,72,153,0.8)]">SCORE</p>
+            <p className="text-2xl font-mono font-bold text-white drop-shadow-[0_0_8px_rgba(255,255,255,0.8)]">{score}</p>
+          </div>
+        </div>
+
+        <div className="flex gap-4">
+          <div className="relative p-1 rounded-sm shadow-[0_0_20px_rgba(34,211,238,0.3)] border border-cyan-500/40 bg-slate-900/50 backdrop-blur-sm">
+            
+            <div 
+              className="grid gap-[2px] bg-slate-950/80 p-[2px]" 
+              style={{ 
+                gridTemplateColumns: `repeat(${BOARD_WIDTH}, minmax(0, 1fr))`,
+                width: 'min(60vw, 240px)',
+                height: 'min(120vw, 480px)'
+              }}
+            >
+              {displayGrid.map((row, y) => 
+                row.map((cell, x) => {
+                  const isCurrentPieceCell = currentPiece && 
+                    y >= currentPiece.y && y < currentPiece.y + currentPiece.shape.length &&
+                    x >= currentPiece.x && x < currentPiece.x + currentPiece.shape[0].length &&
+                    currentPiece.shape[y - currentPiece.y][x - currentPiece.x] !== 0;
+                  
+                  const isVisible = !isDarkMode || !cell || isCurrentPieceCell || cell.isGarbage;
+
+                  return (
+                  <div 
+                    key={`${y}-${x}`} 
+                    className={`w-full h-full rounded-[2px] transition-all duration-200 ${
+                      cell && isVisible ? `${cell.color} border border-white/50 ${cell.glow} z-10 relative` 
+                      : cell && !isVisible ? 'bg-slate-800/10 border border-slate-800/30' 
+                      : 'bg-slate-900/30 border border-slate-800/20' 
+                    }`}
+                  />
+                )})
+              )}
+            </div>
+
+            {(!isPlaying || isGameOver) && (
+              <div className="absolute inset-0 bg-slate-950/80 flex flex-col items-center justify-center backdrop-blur-md z-20 border border-pink-500/30">
+                {isGameOver ? (
+                  <>
+                    <h2 className="text-pink-500 text-4xl font-black mb-1 tracking-widest drop-shadow-[0_0_15px_rgba(236,72,153,0.9)]">SYSTEM DOWN</h2>
+                    <p className="mb-8 text-cyan-300 font-mono drop-shadow-[0_0_5px_rgba(103,232,249,0.8)]">FINAL SCORE: <span className="text-white text-xl">{score}</span></p>
+                  </>
+                ) : (
+                  <h2 className="text-cyan-400 text-2xl font-bold mb-6 tracking-widest drop-shadow-[0_0_10px_rgba(34,211,238,0.9)]">SYSTEM READY</h2>
+                )}
+                <button 
+                  onClick={startGame}
+                  className="bg-transparent text-white font-black py-3 px-8 border-2 border-cyan-400 rounded-md shadow-[0_0_15px_rgba(34,211,238,0.4),inset_0_0_10px_rgba(34,211,238,0.4)] hover:bg-cyan-400 hover:text-slate-900 hover:shadow-[0_0_20px_rgba(34,211,238,0.8)] transition-all active:scale-95"
+                >
+                  {isGameOver ? 'REBOOT' : 'START SYSTEM'}
+                </button>
+              </div>
+            )}
+            
+            {isPlaying && (
+              <div className="absolute -left-3 top-0 bottom-0 w-1.5 bg-slate-800/50 rounded-full overflow-hidden border border-pink-500/20">
+                <div 
+                  className="w-full bg-pink-500 shadow-[0_0_10px_rgba(236,72,153,0.8)] transition-all duration-100 ease-linear origin-bottom"
+                  style={{ 
+                    height: '100%', 
+                    animation: isPlaying ? `shrink ${garbageTimer}ms linear infinite` : 'none' 
+                  }}
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-col items-center">
+            <div className="bg-slate-900/50 p-3 border border-purple-500/50 w-24 h-24 flex items-center justify-center mb-2 shadow-[0_0_15px_rgba(168,85,247,0.3)] rounded-sm backdrop-blur-sm">
+              {nextPiece && (
+                <div className="grid gap-[2px]" style={{ gridTemplateColumns: `repeat(${nextPiece.shape[0].length}, 16px)` }}>
+                  {nextPiece.shape.map((row, y) => 
+                    row.map((val, x) => (
+                      <div key={`next-${y}-${x}`} className={`w-4 h-4 rounded-sm ${val ? `${nextPiece.color} border border-white/50 ${nextPiece.glow}` : 'bg-transparent'}`} />
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+            <p className="text-[10px] text-purple-400 font-bold tracking-widest mb-4 drop-shadow-[0_0_5px_rgba(168,85,247,0.8)]">NEXT</p>
+            
+            <div className="text-[10px] text-cyan-500/70 mt-auto text-center space-y-2 hidden md:block font-mono">
+               <p>↑ : ROTATE</p>
+               <p>↓ : SOFT DROP</p>
+               <p>SPACE : HARD DROP</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-6 grid grid-cols-3 gap-2 max-w-[280px] mx-auto z-10 relative">
+          <div className="col-start-2">
+            <ControlButton onClick={rotate} label="Rotate" borderColor="border-cyan-500/50" textShadow="drop-shadow-[0_0_5px_rgba(34,211,238,0.8)] text-cyan-400" text="↑" />
+          </div>
+          <div className="col-start-1 col-span-3 flex justify-between gap-2 mt-1">
+            <ControlButton onClick={() => move(-1, 0)} label="Left" borderColor="border-cyan-500/50" textShadow="drop-shadow-[0_0_5px_rgba(34,211,238,0.8)] text-cyan-400" text="←" />
+            <ControlButton onClick={hardDrop} label="Hard Drop" borderColor="border-pink-500/70" textShadow="drop-shadow-[0_0_8px_rgba(236,72,153,0.9)] text-pink-500" text="⚡" />
+            <ControlButton onClick={() => move(1, 0)} label="Right" borderColor="border-cyan-500/50" textShadow="drop-shadow-[0_0_5px_rgba(34,211,238,0.8)] text-cyan-400" text="→" />
+          </div>
+          <div className="col-start-2">
+            <ControlButton onClick={() => move(0, 1)} label="Down" borderColor="border-cyan-500/50" textShadow="drop-shadow-[0_0_5px_rgba(34,211,238,0.8)] text-cyan-400" text="↓" />
+          </div>
+        </div>
+
+      </div>
+      
+      <style dangerouslySetInnerHTML={{__html: `
+        @keyframes shrink {
+          from { transform: scaleY(0); }
+          to { transform: scaleY(1); }
+        }
+      `}} />
+    </div>
+  );
+}
+
+const ControlButton = ({ onClick, label, borderColor, textShadow, text }) => (
+  <button 
+    onClick={(e) => { e.preventDefault(); onClick(); }}
+    className={`bg-slate-900/50 border ${borderColor} text-white rounded-md p-4 flex items-center justify-center transition-all touch-manipulation w-full shadow-[0_0_10px_rgba(255,255,255,0.05),inset_0_0_5px_rgba(255,255,255,0.02)] active:scale-95 hover:bg-slate-800`}
+    aria-label={label}
+  >
+    <span className={`text-xl font-black ${textShadow}`}>{text}</span>
+  </button>
+);
